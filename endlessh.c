@@ -227,6 +227,7 @@ sighup_handler(int signal)
 }
 
 struct config {
+	  int domain;
     int port;
     int delay;
     int max_line_length;
@@ -234,6 +235,7 @@ struct config {
 };
 
 #define CONFIG_DEFAULT { \
+	  .domain					 = AF_INET6, \
     .port            = DEFAULT_PORT, \
     .delay           = DEFAULT_DELAY, \
     .max_line_length = DEFAULT_MAX_LINE_LENGTH, \
@@ -300,6 +302,21 @@ config_set_max_line_length(struct config *c, const char *s, int hardfail)
     }
 }
 
+static void
+config_set_domain(struct config *c, const char *s, int hardfail)
+{
+    errno = 0;
+    char *end;
+    long tmp = strtol(s, &end, 10);
+    if (errno || *end || (tmp !=4 && tmp != 6)) {
+        fprintf(stderr, "endlessh: Invalid domain: %s\n", s);
+        if (hardfail)
+            exit(EXIT_FAILURE);
+    } else {
+        c->domain = tmp == 4 ? AF_INET:AF_INET6;
+    }
+}
+
 enum config_key {
     KEY_INVALID,
     KEY_PORT,
@@ -307,6 +324,7 @@ enum config_key {
     KEY_MAX_LINE_LENGTH,
     KEY_MAX_CLIENTS,
     KEY_LOG_LEVEL,
+    KEY_DOMAIN
 };
 
 static enum config_key
@@ -318,6 +336,7 @@ config_key_parse(const char *tok)
         [KEY_MAX_LINE_LENGTH] = "MaxLineLength",
         [KEY_MAX_CLIENTS]     = "MaxClients",
         [KEY_LOG_LEVEL]       = "LogLevel",
+        [KEY_DOMAIN]					= "Domain",
     };
     for (size_t i = 1; i < sizeof(table) / sizeof(*table); i++)
         if (!strcmp(tok, table[i]))
@@ -396,6 +415,9 @@ config_load(struct config *c, const char *file, int hardfail)
                         loglevel = v;
                     }
                 } break;
+                case KEY_DOMAIN:
+                    config_set_domain(c, tokens[1], hardfail);
+                    break;
             }
         }
 
@@ -410,13 +432,14 @@ config_log(const struct config *c)
     logmsg(LOG_INFO, "Delay %ld", c->delay);
     logmsg(LOG_INFO, "MaxLineLength %d", c->max_line_length);
     logmsg(LOG_INFO, "MaxClients %d", c->max_clients);
+    logmsg(LOG_INFO, "Domain %s", c->domain == AF_INET ? "AF_INET":"AF_INET6");
 }
 
 static void
 usage(FILE *f)
 {
     fprintf(f, "Usage: endlessh [-vh] [-d MS] [-f CONFIG] [-l LEN] "
-                               "[-m LIMIT] [-p PORT]\n");
+                               "[-m LIMIT] [-p PORT] [-4]\n");
     fprintf(f, "  -d INT    Message millisecond delay ["
             XSTR(DEFAULT_DELAY) "]\n");
     fprintf(f, "  -f        Set and load config file ["
@@ -427,6 +450,7 @@ usage(FILE *f)
     fprintf(f, "  -m INT    Maximum number of clients ["
             XSTR(DEFAULT_MAX_CLIENTS) "]\n");
     fprintf(f, "  -p INT    Listening port [" XSTR(DEFAULT_PORT) "]\n");
+    fprintf(f, "  -4        Listen only on IPv4\n");
     fprintf(f, "  -v        Print diagnostics to standard output "
             "(repeatable)\n");
     fprintf(f, "  -V        Print version information and exit\n");
@@ -439,11 +463,11 @@ print_version(void)
 }
 
 static int
-server_create(int port)
+server_create(int domain,int port)
 {
     int r, s, value;
 
-    s = socket(AF_INET6, SOCK_STREAM, 0);
+    s = socket(domain, SOCK_STREAM, 0);
     logmsg(LOG_DEBUG, "socket() = %d", s);
     if (s == -1) die();
 
@@ -454,14 +478,29 @@ server_create(int port)
     if (r == -1)
         logmsg(LOG_DEBUG, "errno = %d, %s", errno, strerror(errno));
 
-    struct sockaddr_in6 addr = {
-        .sin6_family = AF_INET6,
-        .sin6_port = htons(port),
-        .sin6_addr = in6addr_any
-    };
-    r = bind(s, (void *)&addr, sizeof(addr));
-    logmsg(LOG_DEBUG, "bind(%d, port=%d) = %d", s, port, r);
-    if (r == -1) die();
+    if(domain==AF_INET){
+	    struct sockaddr_in addr  = {
+	        .sin_family = AF_INET,
+	        .sin_port = htons(port),
+	        .sin_addr = INADDR_ANY
+	    };
+
+	    r = bind(s, (void *)&addr, sizeof(addr));
+	    logmsg(LOG_DEBUG, "bind(%d, port=%d) = %d", s, port, r);
+	    if (r == -1) die();
+    	
+    } else {
+    	
+	    struct sockaddr_in6 addr = {
+	        .sin6_family = AF_INET6,
+	        .sin6_port = htons(port),
+	        .sin6_addr = in6addr_any
+	    };
+
+	    r = bind(s, (void *)&addr, sizeof(addr));
+	    logmsg(LOG_DEBUG, "bind(%d, port=%d) = %d", s, port, r);
+	    if (r == -1) die();
+    }
 
     r = listen(s, INT_MAX);
     logmsg(LOG_DEBUG, "listen(%d) = %d", s, r);
@@ -503,7 +542,7 @@ main(int argc, char **argv)
     config_load(&config, config_file, 1);
 
     int option;
-    while ((option = getopt(argc, argv, "d:f:hl:m:p:vV")) != -1) {
+    while ((option = getopt(argc, argv, "d:f:hl:m:p:vV4")) != -1) {
         switch (option) {
             case 'd':
                 config_set_delay(&config, optarg, 1);
@@ -524,6 +563,9 @@ main(int argc, char **argv)
                 break;
             case 'p':
                 config_set_port(&config, optarg, 1);
+                break;
+            case '4':
+                config_set_domain(&config, "4", 1);
                 break;
             case 'v':
                 if (!loglevel++)
@@ -567,17 +609,18 @@ main(int argc, char **argv)
 
     unsigned long rng = uepoch();
 
-    int server = server_create(config.port);
+    int server = server_create(config.domain,config.port);
 
     while (running) {
         if (reload) {
             /* Configuration reload requested (SIGHUP) */
             int oldport = config.port;
+            int olddomain = config.domain;
             config_load(&config, config_file, 0);
             config_log(&config);
-            if (oldport != config.port) {
+            if (oldport != config.port || olddomain != config.domain) {
                 close(server);
-                server = server_create(config.port);
+                server = server_create(config.domain,config.port);
             }
             reload = 0;
         }
